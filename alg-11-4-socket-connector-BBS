@@ -1,0 +1,352 @@
+/* client end, asynchronous send-receive; connect to input-pad by FIFO */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <sys/signal.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <time.h>
+
+#include "alg.11-0-BBS-8.h"
+
+int pipe_padr; /* named pipes for input-pad read */
+int pipe_hbw; /* named pipes for heart beating write */
+int pipe_brdc; /* broadcasting pad-code */
+int socket_fd;/*套接字标识符*/
+char fifoname[80], fifo_hb[80], fifo_brdc[80];
+
+
+/* get a string of length n-1 from stdin and clear the stdin buffer */
+char *s_gets(char *stdin_buf, int n)
+{
+     char *ret_val;
+     int i = 0;
+
+     ret_val = fgets(stdin_buf, n, stdin);
+     if(ret_val) {
+         while (stdin_buf[i] != '\n' && stdin_buf[i] != '\0') {
+             i++;
+         }
+         if(stdin_buf[i] == '\n') {
+             stdin_buf[i] = '\0';
+         } else {
+             while (getchar() != '\n') ;
+         }
+     }
+  
+     return ret_val;
+}//获取干净的输入，没有换行符和'\0'
+
+
+int random_code(void)
+{
+    int code_len, random_code;
+    long int modulus = 1;
+    int i;
+	
+    code_len = CODE_LEN;//CODE_LEN=5
+    for (i = 1; i < code_len; i++) {
+        modulus = modulus * 10;
+    }
+
+    srand(time(NULL));
+    while (1) {
+        random_code = rand() % modulus;//创建一个小于10000的随机数
+        if(random_code > modulus / 10 - 1) {
+            break;//我们要的是一个范围从1000到9999的随机数
+        }
+    }
+
+    return random_code;
+}
+
+
+void heart_beating(int sec)
+{
+    char bufstr[1];
+    while (1) {
+	write(pipe_hbw, bufstr, 1);
+	sleep(sec);
+    }
+	
+    return;
+}//心跳函数
+
+
+int init_input_pad(void)
+{
+    int pad_code, ret;
+    char code_str[CODE_LEN];
+
+    pad_code = random_code();//创建随机数码赋值给pad_code
+    printf("Generated pad code is: %d\n", pad_code);
+
+    sprintf(code_str, "%d", pad_code);//把pad_code写入成char类型数据code_str
+    strcpy(fifoname, "/tmp/input-pad.fifo-");
+    strcat(fifoname, code_str);
+    printf("fifoname: %s\n", fifoname);//输出管道路径名fifoname
+
+    /* make a FIFO */
+    if(access(fifoname, F_OK) == -1) { /* if FIFO not exists */
+        ret = mkfifo(fifoname, 0666); /* create an FIFO, permission 0666 consistent to open flag O_RDWR */
+        /*mkfifo是一个UNIX系统命令，用于创建一个命名管道（named pipe），也被称为FIFO（first in, first out）。
+          命名管道是一种特殊的文件类型，它提供了一种进程间通信的方式，
+          通过文件系统中的一个特殊文件来进行数据的读写。
+          与匿名管道（通过pipe()函数创建）不同，命名管道可以跨越不同进程、甚至不同主机，从而实现了更加灵活和强大的进程间通信方式。*/
+        if(ret != 0) {
+            ERR_RETURN("\tmkfifo()");
+        } 
+        else {
+            printf("A new FIFO %s for pad connection created\n", fifoname);//创建命名管道成功
+        }
+    } 
+    else  {
+        printf("An FIFO %s for pad connection attached\n", fifoname);//已经建立起了联系
+    }
+        
+    pipe_padr = open(fifoname, O_RDWR);  /* blocking write and blocking read in default */
+    /*命名管道的读取端*/
+    if(pipe_padr < 0) {
+        unlink(fifoname);
+        ERR_RETURN("\tFIFO open()");
+    }
+
+    strcpy(fifo_hb, fifoname);
+    strcat(fifo_hb, ".hb"); /* FIFO for heart beating */
+    if(access(fifo_hb, F_OK) == -1) { /* if FIFO not exists */
+        ret = mkfifo(fifo_hb, 0666); /* create an FIFO heart beating, permission 0666 consistent to open flag O_RDWR */
+        if(ret != 0) {
+            ERR_RETURN("\tmkfifo()");
+        } else {
+            printf("A new FIFO %s for heart beating created\n", fifo_hb);
+        }
+    } else  {
+        printf("An FIFO %s for heart beating attached\n", fifo_hb);
+    }
+
+    pipe_hbw = open(fifo_hb, O_RDWR);  /* blocking write in default */
+    /*心跳写端*/
+    if(pipe_hbw < 0) {
+        close(pipe_padr);
+        unlink(fifoname);
+        unlink(fifo_hb);
+        ERR_RETURN("\tFIFO open()");
+    }
+
+    strcpy(fifo_brdc, "/tmp/input-pad.fifo-brdc"); /* FIFO for pad-code broadcasting */
+    if(access(fifo_brdc, F_OK) == -1) { /* if FIFO not exists */
+        ret = mkfifo(fifo_brdc, 0666); /* create an FIFO heart beating, permission 0666 consistent to open flag O_RDWR */
+        if(ret != 0) {
+            ERR_RETURN("\tmkfifo()");
+        } 
+        else {
+            printf("A new FIFO %s for pad code broadcasting created\n", fifo_brdc);
+        }
+    } 
+    else  {
+        printf("An FIFO %s for pad code broadcasting attached\n", fifo_brdc);
+    }
+    /*创建管道作为pad code的广播*/
+    pipe_brdc = open(fifo_brdc, O_RDWR);  /* blocking read and write in default */
+    if(pipe_brdc < 0) {
+        close(pipe_padr);
+        close(pipe_hbw);
+        unlink(fifoname);
+        unlink(fifo_hb);
+        ERR_RETURN("\tFIFO open()");
+    }
+
+    ret = write(pipe_brdc, code_str, CODE_LEN);
+
+    return EXIT_SUCCESS;
+}
+
+
+/* 创建服务器套接字 */
+int init_socket(void)
+{
+    char ip_addr[INET_ADDRSTRLEN]; /* length of 16 including the last '\0' */
+    char port_str[6];
+    uint16_t port_num;//端口号
+    struct hostent *host;
+    /*用于表示一个主机的信息:
+    struct hostent {
+    char *h_name;           // 官方主机名
+    char **h_aliases;       // 主机别名列表
+    int h_addrtype;         // 主机地址类型
+    int h_length;           // 主机地址长度
+    char **h_addr_list;     // 主机地址列表
+    };
+    h_name：一个指向官方主机名的指针，即DNS服务器中注册的主机名。
+    h_aliases：一个指向主机别名列表的指针数组，即DNS服务器中与官方主机名相关联的任何其他名称。列表以空指针结尾。
+    h_addrtype：主机地址类型，通常为AF_INET（IPv4地址）或AF_INET6（IPv6地址）。
+    h_length：主机地址长度，以字节为单位。
+    h_addr_list：一个指向主机地址列表的指针数组，即主机的IP地址列表。列表以空指针结尾。
+    */
+    socklen_t addr_len;
+    int ret;
+    struct sockaddr_in server_addr, connect_addr;//IPv4
+
+    printf("Input server's hostname/ipv4: "); /* www.baidu.com or xxx.xxx.xxx.xxx */
+    memset(ip_addr, 0, INET_ADDRSTRLEN);
+    s_gets(ip_addr, INET_ADDRSTRLEN); 
+    //输入服务端名字
+
+    printf("Input server's port number: ");
+    memset(port_str, 0, 6);
+    s_gets(port_str, 6);
+    port_num = atoi(port_str);
+    //输入服务端口号
+
+    host = gethostbyname(ip_addr);//通过名字获取主机的相关信息
+    if(host == NULL) {
+        printf("\tinvalid name or ip-address\n");
+        return EXIT_FAILURE;
+    }
+    printf("server official name = %s\n", host->h_name);
+
+    char **ptr = host->h_addr_list;
+    for (; *ptr != NULL; ptr++) {
+        inet_ntop(host->h_addrtype, *ptr, ip_addr, sizeof(ip_addr));
+        printf("server address = %s\n", ip_addr);
+    }
+
+    /* create a connection socket */
+    socket_fd = socket(AF_INET, SOCK_STREAM, 0);//创建套接字标识符socket_fd
+    if(socket_fd  == -1) { 
+        ERR_RETURN("\tsocket()");
+    }
+    
+    /* set sockaddr_in of server-side */
+    server_addr.sin_family = AF_INET;//IPv4
+    server_addr.sin_port = htons(port_num);//之前主机的网络字节序的端口号
+    server_addr.sin_addr = *((struct in_addr *)host->h_addr);
+    bzero(&(server_addr.sin_zero), 8);
+
+    addr_len = sizeof(struct sockaddr);
+    ret = connect(socket_fd, (struct sockaddr *)&server_addr, addr_len); /* 与服务端联系，联系成功这个套接字标识符socket_fd将能够进行相关的网络通信 */
+    if(ret == -1) {
+        close(socket_fd);
+        ERR_RETURN("\tconnect()"); 
+    }
+
+    /* connect_fd is allocated a port_number after connecting */
+    addr_len = sizeof(struct sockaddr);
+    ret = getsockname(socket_fd, (struct sockaddr *)&connect_addr, &addr_len);/*获取当地客户端的相关信息存储到connect_addr这个套接字结构体中*/
+    if(ret == -1) {
+        close(socket_fd);
+        ERR_RETURN("\tgetsockname()");
+    }
+    port_num = ntohs(connect_addr.sin_port);
+    strcpy(ip_addr, inet_ntoa(connect_addr.sin_addr));
+    printf("local socket ip addr  = %s, port =  %hu\n", ip_addr, port_num);//输入当地的IP地址和端口号
+    
+    return EXIT_SUCCESS;
+}
+
+
+int main(void)
+{
+    int ret;
+    int sendbytes, recvbytes;
+    pid_t padrpid, hdbtpid;
+
+    send_buf_ptr = (void *)&send_buf;
+        
+    ret = init_socket();//初始化套接字
+    if(ret == EXIT_FAILURE) {
+        exit(EXIT_FAILURE);
+    }
+    
+    ret = init_input_pad();//创建输入垫子？这个pad是什么意思
+    if(ret == EXIT_FAILURE) {
+        close(socket_fd);
+        exit(EXIT_FAILURE);
+    }
+    
+    hdbtpid = fork();//创建子进程
+    if(hdbtpid < 0) {
+        close(pipe_padr);
+        close(socket_fd);
+        unlink(fifoname);
+        unlink(fifo_hb);
+        ERR_EXIT("fork()");
+    }
+
+    if(hdbtpid == 0) { /* child proc */
+        heart_beating(5); /* beating rate = 5 seconds */
+        return EXIT_SUCCESS; /* ignoring all the next statements */
+    }		
+
+    /* parent proc */
+    padrpid = fork();//在父亲进程再创建一个子进程
+    if(padrpid < 0) {
+        close(socket_fd);
+        close(pipe_padr);
+        close(pipe_hbw);
+        unlink(fifoname);
+        unlink(fifo_hb);
+        kill(hdbtpid, SIGKILL);
+        ERR_EXIT("fork()");
+    }
+	
+    if(padrpid > 0) { /* parent proc */	
+        while (1) { /* receiving pipe_padr and sending connect_fd cycle */
+            ret = read(pipe_padr, msg_buf, MSG_SIZE); /* blocking FIFO read from input-pad */
+            if(ret <= 0) {
+                perror("read()"); 
+                continue;
+            }
+            if(strlen(msg_buf) == 0) {
+                continue;
+            }
+            printf("input-pad: %s\n", msg_buf); /* this line is for testing */
+            sendbytes = send(socket_fd, msg_buf, MSG_SIZE, 0); /* blocking socket send */
+            if(sendbytes <= 0) {
+                printf("\tsendbytes = %d. Connection terminated ...\n", sendbytes);
+                continue;
+            }
+            if(strncmp(msg_buf, "#9", 2) == 0) { /* Quit */
+                break;//#9为结束符
+            }  
+        } //在父亲进程读取管道中的数据，然后通过套接字发送数据
+
+        close(socket_fd);
+        close(pipe_padr);
+        close(pipe_hbw);
+        unlink(fifoname);
+        unlink(fifo_hb);
+        kill(hdbtpid, SIGKILL);
+        kill(padrpid, SIGKILL);
+    }
+    else { /* child proc */
+        while (1) { /* receiving connect_fd cycle */
+            recvbytes = recv(socket_fd, send_buf_ptr, SEND_SIZE, 0); /* blocking socket receive */
+            if(recvbytes <= 0) {
+                printf("\tServer terminated ...\n");
+                break;
+            }
+            printf("%s: %s\n", send_buf.nickname, send_buf.msg_buf);
+            if(send_buf.src_sn == -1 && strncmp(send_buf.msg_buf, "#9", 2) == 0) { /* forced quit */
+                printf("I am terminated by Console!\n");
+                break;
+            }
+        }//子进程接收服务端发送的数据（通过套接字）
+        close(socket_fd);
+        close(pipe_padr);
+        close(pipe_hbw);
+        unlink(fifoname);
+        unlink(fifo_hb);
+        kill(hdbtpid, SIGKILL);
+        kill(getppid(), SIGKILL);
+    }
+
+    return EXIT_SUCCESS;
+}
+
