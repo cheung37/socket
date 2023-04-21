@@ -1,0 +1,52 @@
+#include <netinet/in.h>
+
+#define MAX_QUE_CONN_NM 5 /* length of ESTABLISHED queue */
+#define MAX_CONN_NUM 5 /* cumulative number of connecting processes */
+// #define MAX_CONN_NUM 10 /* cumulative number of connecting processes */
+#define CODE_LEN 5  /* 4 digits for input-pad code with \0 at the last */
+
+#define ERR_EXIT(m) \
+    do { \
+        perror(m); \
+        exit(EXIT_FAILURE); \
+    } while(0)
+
+#define ERR_RETURN(m) \
+    do { \
+        perror(m); \
+        return EXIT_FAILURE; \
+    } while(0)
+
+#define SN_SIZE 4
+#define UID_SIZE 4
+#define NICKNAME_LEN 11 /* 10 chars for nickname */
+#define SEND_SIZE 512
+#define MSG_SIZE SEND_SIZE - SN_SIZE - UID_SIZE - NICKNAME_LEN
+
+struct {
+    int uid;
+    int pre_stat;
+    int stat;
+    char nickname[NICKNAME_LEN];//昵称
+    char ip4_addr[INET_ADDRSTRLEN];
+	int port_num;
+} sn_attri[MAX_CONN_NUM]; /* global, initiated by 0s */ 
+
+struct {
+    int src_sn;
+    int uid;
+    char nickname[NICKNAME_LEN];
+    char msg_buf[MSG_SIZE];
+} send_buf; //发送数据缓冲区
+void* send_buf_ptr; /* send_buf_ptr = (void* )&send_ptr */
+char msg_buf[MSG_SIZE];
+
+#define STAT_SIZE 16+INET_ADDRSTRLEN
+struct {
+    int sn;
+	int uid;
+    int stat;
+    char ip4_addr[INET_ADDRSTRLEN];
+	int port_num;
+} stat_buf;//状态缓冲区
+void* stat_buf_ptr;
