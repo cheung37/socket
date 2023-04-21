@@ -1,0 +1,222 @@
+/* input-pad, attatch FIFOs with a BBS terminal */
+/*本程序创建一个pipe，然后通过派生子进程，由父亲进程对pipe写，由子进程对pipe读取*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/signal.h>
+
+#include "alg.11-0-BBS-8.h"
+
+int pipe_hbr; /* 心跳读端 */
+int pipe_padw; /* 输入数据，写端 */
+int pipe_brdc; /* 广播板代码，读取端 */
+
+/* get a string of length n-1 from stdin, save in stdin_buf and clear the stdin */ 
+char *s_gets(char *stdin_buf, int n)
+{
+    char *ret_val;
+    int i = 0;
+
+    ret_val = fgets(stdin_buf, n, stdin);
+    if(ret_val) {
+        while (stdin_buf[i] != '\n' && stdin_buf[i] != '\0') {
+            i++;
+        }
+        if(stdin_buf[i] == '\n') {
+            stdin_buf[i] = '\0';
+        } else {
+            while (getchar() != '\n') ;
+        }
+    }
+
+    return ret_val;
+}//得到干净的输入，不包含换行符和结束符'\0'
+
+void heart_beating(int sec)
+{
+    char bufstr[1];
+    int ret, i = 1;
+    while (1) {
+        ret = read(pipe_hbr, bufstr, 1); /* blocking read */
+	    if(ret <= 0) { /* write-end missed */
+	        printf("Heart beating write-end missed, terminated ... \n");
+                break;
+        }
+    }
+    return;
+}//心跳，读取一个字节
+
+    
+/* 键入pad-code或从pipe_brdc附加FIFO，创建一个可用的FIFO管道 */
+int init_FIFO(int a_m) /* a_m = 1: 手动分配, other: 自动分配 */
+{
+    char code_str[CODE_LEN]; 
+    char fifoname[80], fifo_hb[80], fifo_brdc[80];
+    int flags, ret;
+
+    if(a_m == 1) { /* manual connecting mode */
+        printf("Enter %d-digit pad code: ", CODE_LEN-1); /* pad code is from some BBS terminal */
+        memset(code_str, 0, CODE_LEN);
+        s_gets(code_str, CODE_LEN); /* type in the CODE_LEN-digit code for input-pad */ 
+        sprintf(code_str, "%d", atoi(code_str));//写入到code_str缓冲区中以整型数形式
+        strcpy(fifoname, "/tmp/input-pad.fifo-");
+        strcat(fifoname, code_str);//用于将一个字符串（源字符串）追加到另一个字符串（目标字符串）的末尾，生成一个新的更长的字符串，前面的参数是目的串，后面的参数是源串
+        printf("fifoname: %s\n", fifoname);
+    } 
+    else {//自动分配
+        strcpy(fifo_brdc, "/tmp/input-pad.fifo-brdc"); /* FIFO for pad-code broadcasting */
+        if(access(fifo_brdc, F_OK) == -1) { /* if FIFO not exists */
+                ERR_RETURN("\taccess()");
+        } else {
+                printf("An FIFO %s for pad code broadcasting found\n", fifo_brdc);
+            }
+
+        pipe_brdc = open(fifo_brdc, O_RDONLY);  /* blocking read */
+        //打开指定路径的文件，并返回标识该文件的标识符为pipe_brdc
+        if(pipe_brdc < 0) {
+                ERR_RETURN("\tFIFO open()");
+        }
+
+        ret = read(pipe_brdc, code_str, CODE_LEN); /* blocking read */
+        /*read()是一个UNIX系统调用函数，用于从文件描述符（file descriptor）读取数据到缓冲区。
+        它可以读取多种类型的文件，例如标准输入、标准输出、网络套接字等。在C语言中，read()函数可以通过包含<unistd.h>头文件来使用
+        ssize_t read(int fd, void *buf, size_t count);
+        其中，fd是文件描述符，buf是指向读取数据的缓冲区的指针，count是要读取的字节数。*/
+        strcpy(fifoname, "/tmp/input-pad.fifo-");
+        strcat(fifoname, code_str);
+        printf("fifoname: %s\n", fifoname);
+    }
+	
+    if(access(fifoname, F_OK) == -1) { /* if FIFO not exists */
+        ERR_RETURN("\taccess()");
+    } else {
+        printf("An FIFO %s for pad connection found\n", fifoname);
+    }
+    //以上过程获取先进先出管道的路径，由fifoname这个路径创建管道的写端
+        
+    pipe_padw = open(fifoname, O_WRONLY); /* blocking write and blocking read in default */
+    if(pipe_padw < 0) { 
+        ERR_RETURN("\tFIFO open()");
+    }
+
+    strcpy(fifo_hb, fifoname);
+    strcat(fifo_hb, ".hb"); /* FIFO for heart beating */
+    //创建心跳管道的路径
+    if(access(fifo_hb, F_OK) == -1) { /* if FIFO not exists */
+        ERR_RETURN("\taccess()");
+    } else {
+        printf("An FIFO %s for heart beating found\n", fifo_hb);
+    }
+
+    pipe_hbr = open(fifo_hb, O_RDONLY);  /* 默认堵塞读取，这里由fifo_hb这个文件路径创建管道的读端 */
+    /*open()是一个UNIX系统调用函数，用于打开或创建一个文件，
+    并返回一个文件描述符（file descriptor），该描述符可用于后续的读取、写入或其他操作。在C语言中，open()函数可以通过包含<fcntl.h>头文件来使用。
+    int open(const char *pathname, int flags, mode_t mode);
+    其中，pathname是要打开或创建的文件路径，flags是打开文件的标志位，mode是在创建新文件时设置文件权限的模式。
+    flags和mode是可选参数，如果不需要指定可以传入0。*/
+    if(pipe_hbr < 0) {
+        close(pipe_padw);
+        unlink(fifoname);
+	    unlink(fifo_hb);
+        ERR_RETURN("\tFIFO open()");
+    }
+
+    return EXIT_SUCCESS;
+}
+
+
+void help_print(void)
+{
+    printf("\n\t\t\t==== Client Terminal Command ====\n");
+    printf("\t\t#0 - sn undisturbed: STAT_ACCEPTED/STAT_ACTIVE -> STAT_UNDISTURBED\n");
+    printf("\t\t#1 - sn resumed from UNDISTURBED\n");
+    printf("\t\t#2 - sn renamed nickname\n");
+    printf("\t\t$1 - list sn stat\n");
+    printf("\t\t$2 - list all clients\n");
+    printf("\t\t@nickname msg - select socketfd_cli[sn] with nickname and send mag\n");
+    printf("\n\t\t\t==== Console Terminal Command ====\n");
+    printf("\t\t@nickname #0 - nickname set to BANNED: STAT_ACCEPTED/STAT_ACTIVE -> STAT_BANNED\n");
+    printf("\t\t@nickname #1 - nickname resumed from BANNED\n");
+    printf("\t\t@nickname msg - select socketfd_cli[sn] with nickname and send msg\n");
+    printf("\t\t$ - list all clients\n\n");
+
+    return;
+
+}
+
+
+int main(void)
+{
+    int ret;
+    pid_t htbtpid;
+
+    printf("Enter pad mode (1 - manual, other - auto)\n");
+    memset(msg_buf, 0, MSG_SIZE);
+    s_gets(msg_buf, MSG_SIZE);
+	
+    if(msg_buf[0] == '1') {
+        ret = init_FIFO(1);
+        if(ret == EXIT_FAILURE) {
+            return EXIT_FAILURE;
+        }
+    } else {
+	ret = init_FIFO(2);
+	if(ret == EXIT_FAILURE) {
+            return EXIT_FAILURE;
+        }
+    }
+
+    htbtpid = fork();//创建子进程
+    if(htbtpid < 0) {
+        close(pipe_padw);
+        ERR_EXIT("fork()");
+    }
+    if(htbtpid == 0) { /* child proc */
+		heart_beating(1);
+		close(pipe_padw);
+		close(pipe_hbr);
+		close(pipe_brdc);
+		kill(getppid(), SIGKILL);
+        return EXIT_SUCCESS; /* ignoring all the next statements */
+    }//子进程在心跳函数读取一个字节
+
+    /* 在父亲进程输入数据 */
+    while (1) {
+        printf("Enter some text (--help): \n");
+        memset(msg_buf, 0, MSG_SIZE);
+        s_gets(msg_buf, MSG_SIZE);//输入数据
+        
+        if(strncmp(msg_buf, "--help", 6) == 0) {
+            help_print();
+            continue;
+        }
+
+        ret = write(pipe_padw, msg_buf, MSG_SIZE);//写入pipe_padw这个标识符所指的
+        /*write()是一个UNIX系统调用函数，用于将数据从缓冲区写入到文件描述符（file descriptor）所指向的文件中。
+        ssize_t write(int fd, const void *buf, size_t count);
+        其中，fd是文件描述符，buf是指向要写入数据的缓冲区的指针，count是要写入的字节数。*/
+        if(ret <= 0) {
+            printf("\tConnector terminated ...\n");
+            break;
+        }
+        
+        if(strncmp(msg_buf, "#9", 2) == 0) { /* Quit */
+            kill(htbtpid, SIGKILL);
+            break;
+        }
+    }
+	
+    close(pipe_padw);
+    close(pipe_hbr);
+    close(pipe_brdc);
+    return EXIT_SUCCESS;
+}
+/*关于上面main函数中进程对pipe进行的读写：
+在UNIX和类UNIX系统中，pipe是一种特殊的文件描述符，用于实现进程间通信。
+它并不是一个普通的文件，而是一个由内核创建的、临时的、双向的、字节流式的通信通道。
+pipe实际上是一个内存缓冲区，由两个文件描述符（file descriptors）组成，一个用于读取数据，另一个用于写入数据。
+在创建pipe时，内核会为该通道分配一个缓冲区，它的大小取决于系统的配置和资源。*/
