@@ -1,0 +1,1143 @@
+/* one server, m clients BBS, with private chatting */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <ctype.h>
+#include <sys/time.h>
+#include <time.h>
+
+#include "alg.11-0-BBS-8.h"
+
+#define STAT_NUM 6 /* status range: 0 - STAT_NUM-1 */
+#define STAT_DES_LEN 20 /* status descriptor length */
+#define STAT_NULL 0
+#define STAT_ACCEPTED 1
+#define STAT_ACTIVE 2
+#define STAT_BANNED 3
+#define STAT_UNDISTURBED 4
+#define STAT_RESERVED 5
+
+char stat_des[STAT_NUM][STAT_DES_LEN];
+
+int socketfd_svr; /* bound to server socket */
+int socketfd_cli[MAX_CONN_NUM]; /* bound to client sockets */
+
+int pipe_newsn[2];
+    /* ordinary pipe: main() -> data_center()
+       packet: sn_stat_buf */
+
+int pipe_req_nullsn[2];
+    /* ordinary pipe: main() -> cli_center()
+       packet: sn_stat_buf */
+
+int pipe_resp_nullsn[2];
+    /* ordinary pipe: cli_center() -> main()
+       packet: sn_stat_buf */
+
+int pipe_updatesn[2];
+    /* ordinary pipe: data_center() -> cli_center()
+       packet: sn_stat_buf */
+	   
+int pipe_s2d[2];
+    /* ordinary pipe: send_buf from socket_trans() to data_center()
+       packet: structure of 4(sn)10(nickname)MSG_SIZE(msg_buf) */
+
+int pipe_d2s[MAX_CONN_NUM][2];
+    /* ordinary pipe: send_buf from data_center() to socket_trans()
+       packet: structure of 4(sn)10(nickname)MSG_SIZE */
+	   
+int pipe_padr;
+    /* named pipe: msg_buf from server input-pad to data_center()
+       packet: string of MSG_SIZE */
+
+char fifoname[80];
+
+int pipe_hbw; /* named pipe for heart beating write */
+char fifo_hb[80];
+
+int pipe_brdc; /* named pipe for broadcasting pad-code */
+char fifo_brdc[80];
+
+struct sockaddr_in server_addr, connect_addr;
+
+char server_ip_addr[INET_ADDRSTRLEN]; /* ipv4 address */
+uint16_t server_port_num;
+
+void cli_center(void);
+void data_center(void);
+void socket_trans(int);
+
+
+void init_stat_des(void)//状态初始化
+{
+    strcpy(stat_des[STAT_NULL], "STAT_NULL");
+    strcpy(stat_des[STAT_ACCEPTED], "STAT_ACCEPTED");
+    strcpy(stat_des[STAT_ACTIVE], "STAT_ACTIVE");
+    strcpy(stat_des[STAT_BANNED], "STAT_BANNED");
+    strcpy(stat_des[STAT_UNDISTURBED], "STAT_UNDISTURBED");
+
+    return;
+}
+
+
+void sleep_ms(long int timegap_ms)
+{
+    struct timeval t;//struct timeval是一个C语言结构体，定义在<sys/time.h>头文件中，用于表示时间的值，精确到微秒级别。
+        /*  struct timeval {
+                time_t tv_sec;     // 秒数
+                suseconds_t tv_usec;  // 微秒数
+            };
+        */
+    long curr_s, curr_ms, end_ms;
+
+    gettimeofday(&t, 0);
+    /*gettimeofday()是一个C语言函数，定义在<sys/time.h>头文件中，用于获取当前时间。
+    int gettimeofday(struct timeval *tv, struct timezone *tz);
+    其中，tv参数为指向struct timeval结构体的指针，用于存储获取到的时间值；tz参数为指向struct timezone结构体的指针，用于获取时区信息（已废弃，不推荐使用）。
+    */
+    curr_ms = (long)(t.tv_sec * 1000);
+    end_ms = curr_ms + timegap_ms;
+    while (1) {
+        gettimeofday(&t, 0);
+        curr_ms = (long)(t.tv_sec * 1000);
+        if(curr_ms > end_ms) {
+            break;
+        }
+    }
+    return;
+}
+
+
+/* get a string of length n-1 from stdin and clear the stdin buffer */
+char *s_gets(char *stdin_buf, int n)
+{    
+     char *ret_val;
+     int i = 0;
+     
+     ret_val = fgets(stdin_buf, n, stdin);
+     if(ret_val) {
+         while (stdin_buf[i] != '\n' && stdin_buf[i] != '\0') {
+             i++;
+         }
+         if(stdin_buf[i] == '\n') {
+             stdin_buf[i] = '\0';
+         } else {
+             while (getchar() != '\n') ;
+         }
+     }
+     return ret_val;
+}
+
+
+/* generate a random number with (CODE_LEN-1) digits */
+int random_code(void)
+{
+    int code_len, random_code;
+    long int modulus = 1;
+    int i;
+	
+    code_len = CODE_LEN;
+    for (i = 1; i < code_len; i++) {
+        modulus = modulus * 10;
+    }
+	
+    srand(time(NULL));
+    while (1) {
+        random_code = rand() % modulus;
+        if(random_code > modulus / 10 - 1) {
+            break;
+        }
+    }
+    return random_code;
+}//生成1000到9999的随机数码
+
+
+/* not used in this programm */
+void heart_beating(int sec)
+{
+    char bufstr[1];
+    int i = 1;
+    while (1) {
+        write(pipe_hbw, bufstr, 1);
+        sleep(sec);
+    }
+	
+    return;
+}
+
+
+/* save the ipv4 address of this server to ip_addr */
+int getipv4addr(char *ip_addr)
+{
+    struct ifaddrs *ifaddrsptr = NULL;
+    struct ifaddrs *ifa = NULL;
+    void *tmpptr = NULL;
+    int ret;
+    
+    ret = getifaddrs(&ifaddrsptr);
+    if(ret == -1) {
+        ERR_RETURN("\tgetifaddrs()");
+    }
+    
+    ifa = ifaddrsptr;
+    while (ifa != NULL) {
+        if(ifa->ifa_addr) {
+            if(ifa->ifa_addr->sa_family == AF_INET) { /* IPv4 */
+                tmpptr = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+                char addr_buf[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, tmpptr, addr_buf, INET_ADDRSTRLEN);
+                printf("%s IPv4 address = %s\n", ifa->ifa_name, addr_buf);
+                if(strcmp(ifa->ifa_name, "lo") != 0)
+                    strcpy(ip_addr, addr_buf); /* return the ipv4 address */
+            } else if(ifa->ifa_addr->sa_family == AF_INET6) { /* IPv6 */
+                tmpptr = &((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr;
+                char addr_buf[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET6, tmpptr, addr_buf, INET6_ADDRSTRLEN);
+                printf("%s IPv6 address = %s\n", ifa->ifa_name, addr_buf);
+            }
+        }
+        ifa = ifa->ifa_next;
+    }
+
+    if(ifaddrsptr != NULL) {
+        freeifaddrs(ifaddrsptr);
+    }
+
+    return EXIT_SUCCESS;
+}//获取系统中所有端口的信息，可以看到相关网卡的IP地址，然后获取这个IP地址，在这个过程中打印了所有端口相关信息
+
+
+int init_input_pad(void)
+{   
+    int pad_code, ret, flags;
+    char code_str[CODE_LEN];
+
+    pad_code = random_code();
+    printf("Generated pad code is: %d\n", pad_code);
+
+    /* make a FIFO, connecting with an input-pad process */
+    sprintf(code_str, "%d", pad_code);
+    strcpy(fifoname, "/tmp/input-pad.fifo-");
+    strcat(fifoname, code_str);
+    printf("fifoname: %s\n", fifoname);
+    if(access(fifoname, F_OK) == -1) { /* if FIFO not exists */
+        ret = mkfifo(fifoname, 0666); /* create an FIFO, permission 0666 consistent to open flag O_RDWR */
+        if(ret != 0) {
+            ERR_EXIT("\tmkfifo()");
+        } else {
+            printf("A new FIFO %s for pad connection created\n", fifoname);
+        }
+    } else {
+        printf("An FIFO %s for pad connection attached\n", fifoname);
+    }
+
+    pipe_padr = open(fifoname, O_RDWR);  /* blocking write and blocking read in default */
+    if(pipe_padr < 0) {
+        ERR_EXIT("\tFIFO open()");
+    }
+    flags = fcntl(pipe_padr, F_GETFL, 0);
+    /*fcntl()是一个系统调用函数，用于对文件描述符进行控制操作。它通常被用于实现文件锁、非阻塞I/O等操作。*/
+    fcntl(pipe_padr, F_SETFL, flags | O_NONBLOCK); /* set to non-blocking */
+
+    /* make a FIFO for heart beating */
+    strcpy(fifo_hb, fifoname);
+    strcat(fifo_hb, ".hb");
+    if(access(fifo_hb, F_OK) == -1) { /* if FIFO not exists */
+        ret = mkfifo(fifo_hb, 0666); /* create an FIFO heart beating, permission 0666 consistent to open flag O_RDWR */
+        if(ret != 0) {
+            ERR_RETURN("\tmkfifo()");
+        } else {
+            printf("A new FIFO %s for heart beating created\n", fifo_hb);
+        }
+    } else  {
+        printf("An FIFO %s for heart beating attached\n", fifo_hb);
+    }
+
+    pipe_hbw = open(fifo_hb, O_RDWR);  /* blocking write in default */
+    if(pipe_hbw < 0) {
+        close(pipe_padr);
+        unlink(fifoname);
+        unlink(fifo_hb);
+        ERR_RETURN("\tFIFO open()");
+    }
+
+    /* make a FIFO for pad-code broadcasting */
+    strcpy(fifo_brdc, "/tmp/input-pad.fifo-brdc");
+    if(access(fifo_brdc, F_OK) == -1) { /* if FIFO not exists */
+        ret = mkfifo(fifo_brdc, 0666); /* create an FIFO heart beating, permission 0666 consistent to open flag O_RDWR */
+        if(ret != 0) {
+            ERR_RETURN("\tmkfifo()");
+        } else {
+            printf("A new FIFO %s for pad code broadcasting created\n", fifo_brdc);
+        }
+    } else  {
+        printf("An FIFO %s for pad code broadcasting attached\n", fifo_brdc);
+    }
+
+    pipe_brdc = open(fifo_brdc, O_RDWR);  /* blocking read and write in default */
+    if(pipe_brdc < 0) {
+        close(pipe_padr);
+        close(pipe_hbw);
+        unlink(fifoname);
+        unlink(fifo_hb);
+        ERR_RETURN("\tFIFO open()");
+    }
+
+    ret = write(pipe_brdc, code_str, CODE_LEN);//把生成的随机数码写到广播端中
+   
+    return EXIT_SUCCESS;
+}
+
+
+int init_pipe(void)//给上述每一个匿名管道都初始化
+{
+    int sn, ret, flags;
+
+    ret = pipe(pipe_newsn);
+    /*pipe()是一个系统调用函数，用于创建一个管道（pipe），实现进程间通信（IPC）
+    int pipe(int pipefd[2]);
+    其中，pipefd参数是一个长度为2的整型数组，用于返回管道的读写文件描述符。pipefd[0]表示管道的读取端，pipefd[1]表示管道的写入端。
+
+    当调用pipe()函数成功后，将创建一个匿名管道，并将其读写文件描述符分别存放在pipefd[0]和pipefd[1]中。
+    管道具有FIFO（先进先出）的特点，写入端向管道写入数据，读取端从管道读取数据。
+
+    在使用管道进行进程间通信时，通常有一个进程向管道写入数据，另一个进程从管道读取数据。
+    如果需要实现双向通信，可以创建两个管道，分别用于两个方向的通信。
+
+    需要注意的是，管道是一种单向通信机制，即写入端的数据只能被读取端读取，反之亦然。
+    在实现双向通信时，需要创建两个管道，分别用于两个方向的通信。
+    */
+    if(ret == -1) {
+        ERR_EXIT("\tpipe(pipe_newsn)");
+    }
+    flags = fcntl(pipe_newsn[0], F_GETFL, 0);
+    fcntl(pipe_newsn[0], F_SETFL, flags | O_NONBLOCK);//不阻塞
+
+    ret = pipe(pipe_req_nullsn);
+    if(ret == -1) {
+        ERR_EXIT("\tpipe(pipe_req_nullsn)");
+    }
+    flags = fcntl(pipe_req_nullsn[0], F_GETFL, 0);
+    fcntl(pipe_req_nullsn[0], F_SETFL, flags | O_NONBLOCK);
+
+    ret = pipe(pipe_resp_nullsn); /* blocking read */
+    if(ret == -1) {
+        ERR_EXIT("\tpipe(pipe_resp_nullsn)");
+    }
+
+    ret = pipe(pipe_updatesn);
+    if(ret == -1) {
+        ERR_EXIT("\tpipe(pipe_updatesn)");
+    }
+    flags = fcntl(pipe_updatesn[0], F_GETFL, 0);
+    fcntl(pipe_updatesn[0], F_SETFL, flags | O_NONBLOCK);
+
+    ret = pipe(pipe_s2d);
+    if(ret == -1) {
+        ERR_EXIT("\tpipe(pipe_s2d)");
+    }
+    flags = fcntl(pipe_s2d[0], F_GETFL, 0);
+    fcntl(pipe_s2d[0], F_SETFL, flags | O_NONBLOCK);
+
+    for (sn = 0; sn < MAX_CONN_NUM; sn++) {
+        ret = pipe(pipe_d2s[sn]);
+        if(ret == -1) {
+            printf("\tpipe(pipefd[%d]) error: ", sn);
+            ERR_EXIT(NULL);
+        }
+    }
+    for (sn = 0; sn < MAX_CONN_NUM; sn++) {
+        flags = fcntl(pipe_d2s[sn][0], F_GETFL, 0);
+        fcntl(pipe_d2s[sn][0], F_SETFL, flags | O_NONBLOCK);
+        flags = fcntl(pipe_d2s[sn][1], F_GETFL, 0);
+        fcntl(pipe_d2s[sn][1], F_SETFL, flags | O_NONBLOCK); /* for cyclic unblocking write */
+    }
+
+    return EXIT_SUCCESS;
+}
+
+
+int init_socket(void)//初始化套接字，这应该是一个服务端
+{
+    int ret;
+    struct sockaddr_in server_addr, connect_addr;
+    socklen_t addr_len;
+
+    socketfd_svr = socket(AF_INET, SOCK_STREAM, 0); /* create an ipv4 server*/
+    if(socketfd_svr == -1) {
+        ERR_EXIT("\tsocket()");
+    }
+    printf("socketfd_svr = %d\n", socketfd_svr);
+
+    ret = getipv4addr(server_ip_addr); /* get server ipv4 address */
+    if(ret == EXIT_FAILURE) {
+        close(socketfd_svr);
+        ERR_EXIT("\tgetifaddrs()");
+    }
+    printf("Server ipv4 addr: %s\n", server_ip_addr);
+
+    /* set sockaddr_in */
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = 0; /* auto server port number */
+    server_addr.sin_addr.s_addr = inet_addr(server_ip_addr);
+    bzero(&(server_addr.sin_zero), 8); /* padding with 0's */
+
+    int opt_val = 1;
+    setsockopt(socketfd_svr, SOL_SOCKET, SO_REUSEADDR, &opt_val, sizeof(opt_val)); /* many options */
+
+    addr_len = sizeof(struct sockaddr);
+    ret = bind(socketfd_svr, (struct sockaddr *)&server_addr, addr_len);//将套接字标识符和结构体绑定
+    if(ret == -1) {
+        close(socketfd_svr);
+        ERR_EXIT("\tbind()");
+    }
+    printf("Bind success!\n");
+
+    addr_len = sizeof(server_addr);
+    ret = getsockname(socketfd_svr, (struct sockaddr *)&server_addr, &addr_len);//写入端口号
+    if(ret == 0) {
+        server_port_num = ntohs(server_addr.sin_port);
+        printf("Server port number = %hu\n", server_port_num);
+    } else {
+        close(socketfd_svr);
+        ERR_EXIT("\tgetsockname()");
+    }
+
+    ret = listen(socketfd_svr, MAX_QUE_CONN_NM);//侦听是否有客户端向该服务端发送请求
+    if(ret == -1) {
+        close(socketfd_svr);
+        ERR_EXIT("\tlisten()");
+    }
+    printf("Listening ...\n");
+      
+    return EXIT_SUCCESS;
+}
+
+
+int main(void)//主函数
+{
+    int curr_sn, sn; /* index of sn_attri[], 0 .. MAX_CONN_NUM-1 */
+    int uid; /* 0 for Console */
+    int stat;
+    int ret;
+    pid_t data_pid, cli_pid, socket_pid;
+    socklen_t addr_len;
+    char cli_ip_addr[INET_ADDRSTRLEN];
+    uint16_t cli_port_num;
+
+    send_buf_ptr = (void* )&send_buf;
+    stat_buf_ptr = (void* )&stat_buf;
+
+    init_stat_des();//初始化状态
+
+    ret = init_input_pad();//初始化输入pad
+    if(ret == EXIT_FAILURE) {
+        return EXIT_FAILURE;
+    }
+
+    ret = init_pipe();//初始化管道
+    if(ret == EXIT_FAILURE) {
+        return EXIT_FAILURE;
+    }
+
+    ret = init_socket();//初始化套接字
+    if(ret == EXIT_FAILURE) {
+        return EXIT_FAILURE;
+    }
+
+    for (sn = 0; sn < MAX_CONN_NUM; sn++) {
+        sn_attri[sn].uid = -1;
+        sn_attri[sn].stat = STAT_NULL;
+        strcpy(sn_attri[sn].nickname, "Anonymous");
+    }//初始化sn_attri这个数组，相关信息可以查看头文件
+
+    data_pid = fork();
+    if(data_pid < 0) {
+        close(socketfd_svr);
+        ERR_EXIT("\tfork()");
+    }
+    if(data_pid == 0) { /* child proc */
+        data_center();//子进程进入数据中心
+        return EXIT_SUCCESS; /* ignoring all the next statements */
+    }
+
+    cli_pid = fork();
+    if(cli_pid < 0) {
+        close(socketfd_svr);
+        ERR_EXIT("\tfork()");
+    }
+    if(cli_pid == 0) { /* child proc */
+        cli_center();//子进程进入客户中心
+        return EXIT_SUCCESS; /* ignoring all the next statements */
+    }
+
+    /* parent proc */
+    uid = 0;
+    while (1) {
+        memset(stat_buf_ptr, 0, STAT_SIZE);
+        ret = write(pipe_req_nullsn[1], stat_buf_ptr, STAT_SIZE);
+        if(ret <= 0) {
+            perror("\tpipe_req_nullsn write()");
+        };
+        ret = read(pipe_resp_nullsn[0], stat_buf_ptr, STAT_SIZE); /* blocking read */
+        if(ret <= 0) {
+            continue;
+        }
+        curr_sn = stat_buf.sn;
+        addr_len = sizeof(struct sockaddr); /* addr_len should be refreshed each time accept() called */
+        socketfd_cli[curr_sn] = accept(socketfd_svr, (struct sockaddr *)&connect_addr, &addr_len);
+        if(socketfd_cli[curr_sn] == -1) {
+            perror("\taccept()");
+            continue;
+        }
+        cli_port_num = ntohs(connect_addr.sin_port);
+        strcpy(cli_ip_addr, inet_ntoa(connect_addr.sin_addr));
+        uid++;
+        printf("New socket: curr_sn %d, user_id %d, fd %d, IP_addr %s, port %hu\n", curr_sn, uid, socketfd_cli[curr_sn], cli_ip_addr, cli_port_num);
+        //创建新的socket？最多不超过5个
+        
+        socket_pid = fork();
+        if(socket_pid < 0) {
+            printf("\tfork error, connection discarded. curr_sn %d, uid %d\n", curr_sn, uid);
+            perror("\tfork()");
+            continue;
+        }
+        if(socket_pid == 0) { /* child pro */ 
+            socket_trans(curr_sn); /* run for each BBS client asychronously */
+            exit(EXIT_SUCCESS); /* ignoring all the next statements */
+        }
+
+        /* parent proc */
+        memset(stat_buf_ptr, 0, STAT_SIZE);
+        stat_buf.sn = curr_sn;
+        stat_buf.uid = uid;//用户id
+        stat_buf.stat = STAT_ACCEPTED;//状态
+        strcpy(stat_buf.ip4_addr, cli_ip_addr);//IP地址
+        stat_buf.port_num = cli_port_num;//端口号
+        ret = write(pipe_newsn[1], stat_buf_ptr, STAT_SIZE);
+        if(ret <= 0) {
+            perror("\tpipe_newsn write()");
+        }
+
+        memset(send_buf_ptr, 0, SEND_SIZE);
+        send_buf.src_sn = -1;
+        send_buf.uid = 0;
+        strcpy(send_buf.nickname, "Console");
+        strcpy(send_buf.msg_buf, "Initiate you nickname by command [#2 nickname] ...");
+        ret = write(pipe_d2s[curr_sn][1], send_buf_ptr, SEND_SIZE);
+        if(ret <= 0) {
+            perror("\tpipe_d2s write()");
+        }
+
+        /* parent pro continue to request a NULL sn and accept a new client */
+    }
+
+    wait(0);
+
+    close(socketfd_svr);
+    for (int sn = 0; sn < MAX_CONN_NUM; sn++) {
+        close(socketfd_cli[sn]);
+    }
+
+    close(pipe_newsn[0]);
+    close(pipe_newsn[1]);
+    close(pipe_updatesn[0]);
+    close(pipe_updatesn[1]);
+    close(pipe_req_nullsn[0]);
+    close(pipe_req_nullsn[1]);
+    close(pipe_resp_nullsn[0]);
+    close(pipe_resp_nullsn[1]);
+    close(pipe_s2d[0]);
+    close(pipe_s2d[1]);
+		
+    for (int sn = 0; sn < MAX_CONN_NUM; sn++) {
+        close(pipe_d2s[sn][0]);
+        close(pipe_d2s[sn][1]);
+    }
+
+    close(pipe_padr);
+    unlink(fifoname);
+
+	/* Any others? */
+    
+    return EXIT_SUCCESS;
+}
+
+
+/* listen to pipe_updatesn[0], read stat_buf and modify sn_attri[sn]
+   listen to pipe_req_nullsn[0], pickup a null sn and write stat_buf to main() by pipe_resp_nullsn[1] */
+void cli_center(void)//客户中心
+{
+    int curr_sn = 0;
+    int ret;
+    
+    while (1) {
+        ret = read(pipe_req_nullsn[0], stat_buf_ptr, STAT_SIZE); /* read from main() */
+        if(ret > 0) {
+            while (sn_attri[curr_sn].stat != STAT_NULL) {
+                curr_sn = (curr_sn + 1) % MAX_CONN_NUM;//获取下标值
+                ret = read(pipe_updatesn[0], stat_buf_ptr, STAT_SIZE); /* read from data_center() */
+                if(ret > 0) {
+                    curr_sn = stat_buf.sn;
+                    sn_attri[curr_sn].uid = stat_buf.uid; 
+                    sn_attri[curr_sn].stat = stat_buf.stat; /* may be STAT_NULL or not */
+                }
+            }
+
+            sn_attri[curr_sn].stat = STAT_RESERVED;
+            memset(stat_buf_ptr, 0, STAT_SIZE);
+            stat_buf.sn = curr_sn;
+            stat_buf.uid = -1; /* nonsense */
+            stat_buf.stat = STAT_NULL;
+            ret = write(pipe_resp_nullsn[1], stat_buf_ptr, STAT_SIZE); /* write to main() */
+            if(ret <= 0) {
+                perror("\tpipe_resp_nullsn write()");
+            };
+        } else {
+             ret = read(pipe_updatesn[0], stat_buf_ptr, STAT_SIZE); /* read from data_center() */
+             if(ret > 0) {
+                 curr_sn = stat_buf.sn;
+                 sn_attri[curr_sn].uid = stat_buf.uid;
+                 sn_attri[curr_sn].stat = stat_buf.stat; /* may be STAT_NULL or not */
+             }
+        }
+    }
+
+    return;
+}
+
+
+/* listen to socketfd_cli[sn], receive data and write to data_center() for data analysis
+   listen to pipe_d2s[sn][0], read data from data_center() or main() and send to socketfd_cli[sn] */
+/* main(), data_center() and socket_trans(0), socket_trans(1) ...  concurrently running */
+void socket_trans(int sn)//套接字传输，sn为当前套接字的下标
+{
+    int flags;
+    int recvbytes, sendbytes, ret;
+    int stat;
+
+    flags = fcntl(socketfd_cli[sn], F_GETFL, 0);
+    fcntl(socketfd_cli[sn], F_SETFL, flags | O_NONBLOCK); /* set to non-blocking socket receive */
+
+    while (1) {
+        /* recv socketfd_cli[sn] and write to data_center() */
+        recvbytes = recv(socketfd_cli[sn], msg_buf, MSG_SIZE, MSG_DONTWAIT);
+		
+        if(recvbytes == 0) {
+            printf("\tSocket lost connection ...\n");
+            memset(send_buf_ptr, 0, SEND_SIZE);
+            send_buf.src_sn = sn; /* without uid and nickname */
+            strcpy(send_buf.msg_buf, "#9");
+            ret = write(pipe_s2d[1], send_buf_ptr, SEND_SIZE); /* msg with sn to data_center() */
+            if(ret <= 0) {
+                perror("\tpipe_s2d write()");
+            }
+            break;
+        }
+
+        if(recvbytes > 0) {
+            printf("Socket receive: src_sn %d\n\tmsg: %s\n", sn, msg_buf);//数据接收成功
+            memset(send_buf_ptr, 0, SEND_SIZE);
+            send_buf.src_sn = sn; /* without uid and nickname */
+            strcpy(send_buf.msg_buf, msg_buf);
+            ret = write(pipe_s2d[1], send_buf_ptr, SEND_SIZE); /* msg with sn to data_center() */
+            if(ret <= 0) {
+                perror("\tpipe_s2d write()");
+            }
+
+            if(strncmp(msg_buf, "#9", 2) == 0) { /* socketfd_cli[sn] claims quit */
+                break;
+            }
+
+        }
+		
+        /* read pipe_d2s[sn] and send to socketfd_cli[sn] */
+        ret = read(pipe_d2s[sn][0], send_buf_ptr, SEND_SIZE);//主函数写入，由这里读取
+        if(ret > 0) { /* send send_buf to socketfd_cli[sn] */
+            printf("\tsend_buf ready: src_sn %d, uid %d, nickname %s, dest.sn %d\n\tmsg: %s\n", send_buf.src_sn, send_buf.uid, send_buf.nickname, sn, send_buf.msg_buf);
+            sendbytes = send(socketfd_cli[sn], send_buf_ptr, SEND_SIZE, 0); /* blocking socket send */
+            if(sendbytes <= 0) {
+                printf("send_buf send() to socket_cli[%d] fail\n", sn);
+                perror(NULL);
+            } else {
+                printf("\tSocket sendbytes: %d\n", sendbytes);
+            }
+            
+            if(send_buf.uid == 0 && strncmp(send_buf.msg_buf, "#9", 2) == 0) { /* from Console */
+                break;
+            }
+        }//套接字之间发送数据？
+
+// sleep_ms((long)100); /* a nice giving */
+
+    }
+    return;
+}
+
+
+void data_center(void)
+{
+    /*  read stat_buf for new client sn from main() by pipe_newsn[0], set uid, nickname, and stat to STAT_ACCEPTED
+        read send_buf from socket_trans() by pipe_s2d, analysing send_buf_msg_buf:
+            command #0 - sn undisturbed: STAT_ACCEPTED/STAT_ACTIVE -> STAT_UNDISTURBED
+            command #1 - sn resumed from UNDISTURBED
+            command #2 - sn renamed nickname, set to STAT_ACTIVE
+            command $1 - list sn stat
+            command $2 - list all clients
+            command @nickname msg - select socketfd_cli[sn] with nickname and send msg
+            normal msg_buf - broadcasting to clients of STAT_ACCEPTED/STAT_ACTIVE
+        read msg_buf from input-pad by pipe_padr, analysing msg_buf:
+            command @nickname #0 - nickname set to BANNED
+            command @nickname #1 - nickname resumed from BANNED
+            command @nickname msg - select socketfd_cli[sn] with nickname and send msg
+            command $ - list all clients
+            normal msg_buf - broadcasting to clients of STAT_ACCEPTED/STAT_ACTIVE
+        write stat_buf for deleted sn to cli_center() by pipe_delesn[1], set stat to STAT_NULL
+    */
+
+    int src_sn, sn, uid, pre_stat;
+    int flags, ret, counter;
+    char tmp_nickname[MSG_SIZE], tmp_msg[MSG_SIZE];
+    char pre_nickname[NICKNAME_LEN];
+    
+    while (1) { 
+        while (1) { /* listen to main(), read a new socketfd with sn, uid and STAT_ACCEPTED from main() */
+            ret = read(pipe_newsn[0], stat_buf_ptr, STAT_SIZE);
+            if(ret <= 0) { /* pipe empty */
+                break;
+            } 
+            
+            sn = stat_buf.sn;
+            sn_attri[sn].uid = stat_buf.uid;
+            sn_attri[sn].pre_stat = sn_attri[sn].stat;
+            sn_attri[sn].stat = stat_buf.stat; /* STAT_ACCEPTED */
+            strcpy(sn_attri[sn].nickname, "Anonymous");
+            strcpy(sn_attri[sn].ip4_addr, stat_buf.ip4_addr);
+            sn_attri[sn].port_num = stat_buf.port_num;
+            printf("New sn: sn %d, uid %d, stat %s -> ACCEPTED\n", sn, sn_attri[sn].uid, stat_des[sn_attri[sn].pre_stat]);
+			
+            ret = write(pipe_updatesn[1], stat_buf_ptr, STAT_SIZE); /* write to cli_center() */
+            if(ret <= 0) {
+                perror("\tpipe_updatesn write()");
+            }
+        }
+        
+        while (1) { /* listen to socket_trans(), read send_buf and analyze */
+            ret = read(pipe_s2d[0], send_buf_ptr, SEND_SIZE);
+            if(ret <= 0) { /* pipe empty */
+                break;
+            }
+            
+            src_sn = send_buf.src_sn; /* source socketfd_cli[sn] */
+            if(sn_attri[src_sn].stat == STAT_NULL) {
+                continue;
+            } 
+            
+            strcpy(msg_buf, send_buf.msg_buf);
+            
+            if(strncmp(msg_buf, "#9", 2) == 0) {
+                printf("Terminating: src_sn %d, uid %d, stat %s -> STAT_NULL\n", src_sn, sn_attri[src_sn].uid, stat_des[sn_attri[src_sn].stat]);
+                sn_attri[src_sn].uid = -1;
+                sn_attri[src_sn].stat = STAT_NULL;
+                strcpy(sn_attri[src_sn].nickname, "Anonymous");
+                strcpy(sn_attri[src_sn].ip4_addr, "");
+                sn_attri[src_sn].port_num = 0;
+				
+                memset(stat_buf_ptr, 0, STAT_SIZE);
+                stat_buf.sn = src_sn;
+                stat_buf.uid = -1;
+                stat_buf.stat = STAT_NULL;
+                ret = write(pipe_updatesn[1], stat_buf_ptr, STAT_SIZE); /* write to cli_center() */
+                if(ret <= 0) {
+                    perror("\tpipe_updatesn write()");
+                }
+                continue;
+            }
+
+            if(sn_attri[src_sn].stat == STAT_BANNED) {
+                memset(send_buf_ptr, 0, SEND_SIZE);
+                send_buf.src_sn = -1;
+                send_buf.uid = 0;
+                strcpy(send_buf.nickname, "Console");
+                strcpy(send_buf.msg_buf, "You are BANNED!");
+                ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                if(ret < 0) {
+                    printf("\tdest.sn = %d pipe write error, message missed ...\n", src_sn);
+                }
+                continue;
+            }
+            
+            if(sn_attri[src_sn].stat == STAT_ACCEPTED  && strncmp(send_buf.msg_buf, "#2", 2) != 0) {
+                memset(send_buf_ptr, 0, SEND_SIZE);
+                send_buf.src_sn = -1;
+                send_buf.uid = 0;
+                strcpy(send_buf.nickname, "Console");
+                strcpy(send_buf.msg_buf, "Initiate you nickname by command [#2 nickname] ...");
+                ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                if(ret < 0) {
+                    printf("\tdest.sn = %d pipe write error, message missed ...\n", src_sn);
+                }
+                continue;
+            }
+            
+            if(msg_buf[0] != '$' && msg_buf[0] != '#' && msg_buf[0] != '@') { /* normal BBS message */
+                send_buf.src_sn = src_sn;
+                send_buf.uid = sn_attri[src_sn].uid;
+                strcpy(send_buf.nickname, sn_attri[src_sn].nickname);
+                for (sn = 0; sn < MAX_CONN_NUM; sn++) { /* message sent to all sn's */
+                    if(sn_attri[sn].stat == STAT_ACTIVE || sn_attri[sn].stat == STAT_ACCEPTED) {
+                        ret = write(pipe_d2s[sn][1], send_buf_ptr, SEND_SIZE);
+                        if(ret < 0) {
+                            printf("\tdest.sn = %d pipe write error, message missed ...\n", sn);
+                        }
+                    }
+                }
+                continue;
+            }
+            
+            if(msg_buf[0] == '@') { /* @nickname msg: direct sending */
+                sscanf(&msg_buf[1], "%s %s", tmp_nickname, tmp_msg);
+                if(strlen(tmp_nickname) > NICKNAME_LEN-1 || strlen(tmp_nickname) == 0 || strlen(tmp_msg) == 0) {
+                    send_buf.src_sn = -1;
+                    send_buf.uid = 0;
+                    strcpy(send_buf.nickname, "Console");
+                    strcpy(send_buf.msg_buf, "Illegal command line!");
+                    ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                    if(ret < 0) {
+                        printf("\tdest.sn = %d pipe write error, message missed ...\n", src_sn);
+                    }
+                    continue;
+                }
+                    
+                send_buf.src_sn = src_sn;
+                send_buf.uid = sn_attri[src_sn].uid;
+                strcpy(send_buf.nickname, sn_attri[src_sn].nickname);
+                strcpy(send_buf.msg_buf, tmp_msg);
+                counter = 0;
+                for (sn = 0; sn < MAX_CONN_NUM; sn++) { /* looking for tmp_niakname */
+                    if(strcmp(sn_attri[sn].nickname, tmp_nickname) == 0) {
+                        if(sn_attri[sn].stat == STAT_ACTIVE || sn_attri[sn].stat == STAT_ACCEPTED) {
+                            counter++;
+                            ret = write(pipe_d2s[sn][1], send_buf_ptr, SEND_SIZE);
+                            if(ret < 0) {
+                                printf("\tdest.sn = %d pipe write error, message missed ...\n", sn);
+                            }
+                        }
+                    }
+                }
+                send_buf.src_sn = -1;
+                send_buf.uid =0;
+                strcpy(send_buf.nickname, "Console");
+                if(counter == 0) {
+                    sprintf(send_buf.msg_buf, "No valid nickname: %s found", tmp_nickname);
+                    ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                    if(ret < 0) {
+                        printf("\tdest.sn = %d pipe write error, message missed ...\n", src_sn);
+                    }
+                } else {
+                    sprintf(send_buf.msg_buf, "Nickname: %s - %d found and msg sent", tmp_nickname, counter);
+                    ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                    if(ret < 0) {
+                        printf("\tdest.sn = %d pipe write error, message missed ...\n", src_sn);
+                    }
+                }
+                continue;
+            }
+            
+            send_buf.src_sn = -1;
+            send_buf.uid = 0;
+            strcpy(send_buf.nickname, "Console");
+            
+            if(strncmp(msg_buf, "$1", 2) == 0) { /* $1: listing stat of src_cn */
+                sprintf(send_buf.msg_buf, "==== uid %d: %s, %s, %s, %hu ====", sn_attri[src_sn].uid, sn_attri[src_sn].nickname, stat_des[sn_attri[src_sn].stat], sn_attri[src_sn].ip4_addr, sn_attri[src_sn].port_num);
+                ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                if(ret <= 0) {
+                    printf("\tdest.sn = %d pipe write error, message missed ...\n", src_sn);
+                } 
+                continue;
+            }
+            
+            if(strncmp(msg_buf, "$2", 2) == 0) { /* $1: listing all clients */
+                strcpy(send_buf.msg_buf, "============================ Clients List ===============================");
+                ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                if(ret <= 0) {
+                    printf("\tsrc_sn = %d pipe write error, message missed ...\n", src_sn);
+                }    
+                strcpy(send_buf.msg_buf, "           uid    nickname             stat            IP         port");
+                ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                if(ret <= 0) {
+                    printf("\tsrc_sn = %d pipe write error, message missed ...\n", src_sn);
+                }    
+                strcpy(send_buf.msg_buf, "-------------------------------------------------------------------------");
+                ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                if(ret <= 0) {
+                    printf("\tsrc_sn = %d pipe write error, message missed ...\n", src_sn);
+                }    
+                for (sn = 0; sn < MAX_CONN_NUM; sn++) {
+                    if(sn == src_sn) {
+                        sprintf(send_buf.msg_buf, "        %6d  %10s %20s %15s %6d", sn_attri[sn].uid, sn_attri[sn].nickname, stat_des[sn_attri[sn].stat], sn_attri[sn].ip4_addr, sn_attri[sn].port_num);
+                    } else {
+                        sprintf(send_buf.msg_buf, "        %6d  %10s %20s", sn_attri[sn].uid, sn_attri[sn].nickname, stat_des[sn_attri[sn].stat]);
+                    }
+                    ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                    if(ret <= 0) {
+                        printf("\tsrc_sn = %d pipe write error, message missed ...\n", src_sn);
+                        break;
+                    }    
+                }
+                strcpy(send_buf.msg_buf, "===========================================================================");
+                ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                if(ret <= 0) {
+                    printf("\tsrc_sn = %d pipe write error, message missed ...\n", src_sn);
+                }
+                sprintf(send_buf.msg_buf, "Server ip: %s,  port: %hu\n", server_ip_addr, server_port_num);
+                ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                if(ret <= 0) {
+                    printf("\tsrc_sn = %d pipe write error, message missed ...\n", src_sn);
+                }
+
+                continue;
+            }
+            
+            if(strncmp(msg_buf, "#0", 2) == 0) { /* #0: set UNDISTURBED stat */
+                if(sn_attri[src_sn].stat == STAT_ACTIVE || sn_attri[src_sn].stat == STAT_ACCEPTED) {
+                    sn_attri[src_sn].pre_stat = sn_attri[src_sn].stat;
+                    sn_attri[src_sn].stat = STAT_UNDISTURBED;
+                    sprintf(send_buf.msg_buf, "You are set to UNDISTURBED!");
+                    ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                    if(ret <= 0) {
+                        printf("\tdest.sn = %d pipe write error, message missed ...\n", src_sn);
+                    }
+                    continue;
+                } else {
+                    sprintf(send_buf.msg_buf, "You cannot change your stat!");
+                    ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                    if(ret <= 0) {
+                        printf("\tdest.sn = %d pipe write error, message missed ...\n", src_sn);
+                    }
+                    continue;
+                }
+            }
+                
+            if(strncmp(msg_buf, "#1", 2) == 0) { /* #1: resume from UNDISTURBED */
+                if(sn_attri[src_sn].stat == STAT_UNDISTURBED) {
+                    sn_attri[src_sn].stat = sn_attri[src_sn].pre_stat;;
+                    sprintf(send_buf.msg_buf, "You are resumed to %s!", stat_des[sn_attri[src_sn].stat]);
+                    ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                    if(ret <= 0) {
+                        printf("\tdest.sn = %d pipe write error, message missed ...\n", src_sn);
+                    }
+                    continue;
+                } else {
+                    sprintf(send_buf.msg_buf, "You cannot change your stat!");
+                    ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                    if(ret <= 0) {
+                        printf("\tdest.sn = %d pipe write error, message missed ...\n", src_sn);
+                    }
+                    continue;
+                }
+            }
+            
+            if(strncmp(msg_buf, "#2", 2) == 0) { /* #2: rename nickname */
+                sscanf(msg_buf, "%s %s", tmp_msg, tmp_nickname);
+                if(strlen(tmp_msg) > 2 || strlen(tmp_nickname) > NICKNAME_LEN-1 || strlen(tmp_nickname) == 0) {
+                    strcpy(send_buf.msg_buf, "Illegal command line!");
+                    ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                    if(ret < 0) {
+                        printf("\tdest.sn = %d pipe write error, message missed ...\n", src_sn);
+                    }
+                    continue;
+                }
+                    
+                ret = strcmp("Anonymous", tmp_nickname) * strcmp("Console", tmp_nickname);
+                if(ret == 0) {
+                    sprintf(send_buf.msg_buf, "Illegal nickname: %s", tmp_nickname);
+                    ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                    if(ret <= 0) {
+                        printf("\tpipe_d2s[%d] pipe write error, message missed ...\n", src_sn);
+                    }    
+                    continue;
+                }
+                for (sn = 0; sn < MAX_CONN_NUM; sn++) {
+                    ret = strcmp(sn_attri[sn].nickname, tmp_nickname); 
+                    if(ret == 0) {
+                        sprintf(send_buf.msg_buf, "This nickname occupied: %s", tmp_nickname);
+                        ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                        if(ret <= 0) {
+                            printf("\tsn = %d pipe write error, message missed ...\n", src_sn);
+                        }    
+                        continue;
+                    }
+                }
+                if(sn >= MAX_CONN_NUM) { /* tmp_nickname not duplicated */
+                    strcpy(pre_nickname, sn_attri[src_sn].nickname);
+                    strcpy(sn_attri[src_sn].nickname, tmp_nickname);
+                    printf("Nickname changing: uid %d, nickname %s -> %s\n", sn_attri[src_sn].uid, pre_nickname, sn_attri[src_sn].nickname);
+                    sprintf(send_buf.msg_buf, "your nickname changed: %s -> %s", pre_nickname, sn_attri[src_sn].nickname);
+                    ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                    if(ret <= 0) {
+                        printf("\tsn = %d write error, message missed ...\n", src_sn);
+                        continue;
+                    }    
+                    
+                    if(sn_attri[src_sn].stat == STAT_ACCEPTED) {
+                        sn_attri[src_sn].stat = STAT_ACTIVE;
+                        printf("STAT changing: uid %d, stat: STAT_ACCEPTED -> STAT_ACTIVE\n", sn_attri[src_sn].uid);
+                        strcpy(send_buf.msg_buf, "You are set to ACTIVE!");
+                        ret = write(pipe_d2s[src_sn][1], send_buf_ptr, SEND_SIZE);
+                        if(ret <= 0) {
+                            printf("\tdest.sn = %d pipe write error, message missed ...\n", src_sn);
+                        }
+                    }
+
+                    sprintf(send_buf.msg_buf, "Nickname changing: uid %d, nickname %s -> %s", sn_attri[src_sn].uid, pre_nickname, sn_attri[src_sn].nickname);
+                    for (sn = 0; sn < MAX_CONN_NUM; sn++) { /* message sent to all sn's */
+                        if(sn_attri[sn].stat == STAT_ACTIVE || sn_attri[sn].stat == STAT_ACCEPTED) {
+                            ret = write(pipe_d2s[sn][1], send_buf_ptr, SEND_SIZE);
+                            if(ret <= 0) {
+                                printf("\tsn = %d pipe write error, message missed ...\n", sn);
+                            }
+                        }
+                    }
+                } 
+            }
+        }
+        
+        while (1) { /* listen to pipe_padr, read msg_buf from input-pad and analyze */
+            ret = read(pipe_padr, msg_buf, MSG_SIZE);
+            if(ret <= 0) {
+                break;
+            }
+                    
+printf("input-pad: %s\n", msg_buf); /* for testing */
+
+            send_buf.src_sn = -1;
+            send_buf.uid = 0;
+            strcpy(send_buf.nickname, "Console"); /* source msg from Console */
+            
+            if(msg_buf[0] != '@' && msg_buf[0] != '$') { /* normal BBS message */
+                strcpy(send_buf.msg_buf, msg_buf);
+                for (sn = 0; sn < MAX_CONN_NUM; sn++) { /* message sent to all sn's */
+                    if(sn_attri[sn].stat == STAT_ACTIVE || sn_attri[sn].stat == STAT_ACCEPTED) {
+                        ret = write(pipe_d2s[sn][1], send_buf_ptr, SEND_SIZE);
+                        if(ret < 0) {
+                            printf("\tdest.sn = %d pipe write error, message missed ...\n", sn);
+                        }
+                    }
+                }
+                continue;
+            }
+            
+            if(msg_buf[0] == '$') { /* $: listing all sockedfd_cli's */
+              printf("\n============================ Clients List ===============================\n");
+                printf("    sn     uid    nickname             stat            IP         port\n");
+                printf("-------------------------------------------------------------------------\n");
+                for (sn = 0; sn < MAX_CONN_NUM; sn++) {
+                    printf("%6d  %6d  %10s %20s %15s %6d\n", sn, sn_attri[sn].uid, sn_attri[sn].nickname, stat_des[sn_attri[sn].stat], sn_attri[sn].ip4_addr, sn_attri[sn].port_num);
+                }
+                printf("=========================================================================\n");
+                printf("Server ip: %s,  port: %hu\n\n", server_ip_addr, server_port_num);
+                continue;
+            }
+
+                /* @... ... */
+            sscanf(&msg_buf[1], "%s %s", tmp_nickname, tmp_msg);
+            if (strlen(tmp_nickname) > NICKNAME_LEN || strlen(tmp_nickname) == 0 || strlen(tmp_msg) == 0) {
+                printf("\tIllegal command line!");
+                continue;
+            }
+            
+                /* @nickname ... */
+            int counter = 0; 
+            for (sn = 0; sn < MAX_CONN_NUM; sn++) { /* looking for tmp_niakname */
+                if(strcmp(sn_attri[sn].nickname, tmp_nickname) == 0) {
+                    counter++;
+
+                    if(strncmp(tmp_msg, "#9", 2) == 0) { /* @nickname #9msg */
+                        printf("Terminating: uid %d, nickname %s, stat: %s -> STAT_NULL\n", sn_attri[sn].uid, sn_attri[sn].nickname, stat_des[sn_attri[sn].stat]);
+                        sn_attri[sn].uid = -1;
+                        sn_attri[sn].stat = STAT_NULL;
+                        strcpy(sn_attri[sn].nickname, "Anonymous");
+                        strcpy(sn_attri[sn].ip4_addr, "");
+                        sn_attri[sn].port_num = 0;
+
+                        memset(stat_buf_ptr, 0, STAT_SIZE);
+                        stat_buf.sn = sn;
+                        stat_buf.uid = -1;
+                        stat_buf.stat = STAT_NULL;
+                        ret = write(pipe_updatesn[1], stat_buf_ptr, STAT_SIZE); /* write to cli_center() */
+                        if(ret <= 0) {
+                            perror("\tpipe_updatesn write()");
+                        }
+
+                        strcpy(send_buf.msg_buf, tmp_msg);
+                        ret = write(pipe_d2s[sn][1], send_buf_ptr, SEND_SIZE);
+                        if(ret <= 0) {
+                            perror("\tpipe_d2s write()");
+                        }
+						
+                        continue;
+                    }
+
+                    if(strncmp(tmp_msg, "#0", 2) == 0) { /* @nickname #0 */
+                        if(sn_attri[sn].stat == STAT_ACTIVE || sn_attri[sn].stat == STAT_ACCEPTED || sn_attri[sn].stat == STAT_UNDISTURBED) {
+                            printf("Banning: uid %d, nickname %s, stat: %s -> STAT_BANNED\n", sn_attri[sn].uid, sn_attri[sn].nickname, stat_des[sn_attri[sn].stat]);
+                            sn_attri[sn].pre_stat = sn_attri[sn].stat;
+                            sn_attri[sn].stat = STAT_BANNED;
+                            sprintf(send_buf.msg_buf, "You are BANNED!");
+                            ret = write(pipe_d2s[sn][1], send_buf_ptr, SEND_SIZE);
+                            if(ret <= 0) {
+                                printf("\tdest.sn = %d write error, message missed ...\n", sn);
+                            }
+                            continue;
+                        } else {
+                            printf("\tuid %d, nickname %s stat unchanged: %s\n", sn_attri[sn].uid, sn_attri[sn].nickname, stat_des[sn_attri[sn].stat]);
+                            continue;
+                        }
+                    }
+                    
+                    if(strncmp(tmp_msg, "#1", 2) == 0) { /* @nickname #1 */
+                        if(sn_attri[sn].stat == STAT_BANNED) {
+                            printf("Resuming: uid %d, nickname %s, stat: %s -> %s\n", sn_attri[sn].uid, sn_attri[sn].nickname, stat_des[sn_attri[sn].stat], stat_des[sn_attri[sn].pre_stat]);
+                            sn_attri[sn].stat = sn_attri[sn].pre_stat;
+                            sprintf(send_buf.msg_buf, "You are resumed to %s!", stat_des[sn_attri[sn].stat]);
+                            ret = write(pipe_d2s[sn][1], send_buf_ptr, SEND_SIZE);
+                            if(ret <= 0) {
+                                printf("\tdest.sn = %d pipe write error, message missed ...\n", sn);
+                            }
+                            continue;
+                        } else {
+                            printf("\tuid %d, nickname %s stat unchanged: %s\n", sn_attri[sn].uid, sn_attri[sn].nickname, stat_des[sn_attri[sn].stat]);
+                            continue;
+                        }
+                    }
+                    
+                    /* @nickname msg */
+                    strcpy(send_buf.msg_buf, tmp_msg);
+                    if(sn_attri[sn].stat == STAT_ACTIVE || sn_attri[sn].stat == STAT_ACCEPTED) {
+                        ret = write(pipe_d2s[sn][1], send_buf_ptr, SEND_SIZE);
+                        if(ret <= 0) {
+                            printf("\tdest.sn = %d pipe write error, message missed ...\n", sn);
+                        }
+                    }
+                }
+            }
+            if(counter == 0) {
+                printf("\tnickname: %s not found\n", tmp_nickname);
+            } else {
+                printf("\tnickname: %s - %d found and msg sent\n", tmp_nickname, counter);
+            }
+        }
+    }
+    return;
+}
+
